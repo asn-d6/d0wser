@@ -1,46 +1,167 @@
-// lulz dowser
-
 package main
 
 import (
 		"fmt"
 		"os"
-		"io"
-		"encoding/hex" // XXX debug
+		"io/ioutil"
+		"net"
+		"strconv"
+		"encoding/hex"
+		"math/rand"
+		"time"
 )
+
+/* Given the concatenation of the TCP pseudo-header and the TCP
+segment (see RFC793) calculate the checksum that should be placed in
+the TCP packet.  */
+func get_tcp_checksum(data []byte) (checksum uint16) {
+	var i int = 0;
+	var sum int = 0;
+	var size int = len(data);
+
+	for {
+		if (size <= 1) {
+			break;
+		}
+		sum += int(data[i]);
+		sum += int(data[i+1]) << 8;
+		i += 2;
+		size -= 2;
+	}
+
+	if (size == 1) {
+		sum += int(data[i]);
+	}
+
+	sum = int((sum >> 16) + (sum & 0xffff));
+
+	sum += int(sum >> 16);
+
+	// XXX bad code...
+	tmp := uint16(^sum);
+	checksum = (tmp & 0xff00) >> 8;
+	checksum += (tmp & 0xff) << 8;
+	return checksum
+}
+
+/** Return a closure that returns a new TCP port number everytime to
+avoid collisions. DPI boxes don't like source port collisions. */
+func get_next_source_port_n() func() int {
+	rand.Seed(time.Now().UnixNano())
+	i := int(rand.Int31n(28232) + 30000);
+	return func() int { i++ ; return i }
+}
+
+var	next_source_port_n func() int = get_next_source_port_n();
+
+/* Return a TCP packet with payload 'data' to TCP port 'dst_port'. */
+func form_tcp_packet(data []byte, dst_port uint16, conn *net.IPConn, ip string) (packet []byte) {
+	const SEQNUM uint32 = 0x1337;
+	const HDR_LENGTH uint8 = 20/4; // 20 bytes in 32-bit words
+	const WINDOW_SIZE uint16 = 512;
+
+	var SOURCE_PORT uint16 = uint16(next_source_port_n());
+	var tcp_len int = len(data) + 20; // 20 bytes is the minimal TCP header
+
+	/* Create the 'pseudo_header' for the calculation of TCP checksums. */
+	pseudo_header := make([]byte, 12);
+	copy(pseudo_header[0:4], net.ParseIP(conn.LocalAddr().String()).To4());
+	if (conn.RemoteAddr() != nil) {
+		copy(pseudo_header[4:8], net.ParseIP(conn.RemoteAddr().String()).To4());
+	} else {
+		copy(pseudo_header[4:8], net.ParseIP(ip).To4());
+	}
+	pseudo_header[8] = 0; // reserved
+	pseudo_header[9] = 6; // protocol (TCP)
+	pseudo_header[10] = uint8(tcp_len >> 8);
+	pseudo_header[11] = uint8(tcp_len & 255);
+
+	/* Create the actual TCP packet. */
+	packet = make([]byte, tcp_len);
+	packet[0] = uint8(SOURCE_PORT >> 8); /* src port */
+	packet[1] = uint8(SOURCE_PORT & 255); /* src port */
+	packet[2] = uint8(dst_port >> 8); /* dst port */
+	packet[3] = uint8(dst_port & 255); /* dst port */
+	packet[4] = uint8(SEQNUM >> 24); /* seq num */
+	packet[5] = uint8(SEQNUM >> 16); /* seq num */
+	packet[6] = uint8(SEQNUM >> 8); /* seq num */
+	packet[7] = uint8(SEQNUM & 255); /* seq num */
+	packet[8] = 0; /* ack num */
+	packet[9] = 0; /* ack num */
+	packet[10] = 0; /* ack num */
+	packet[11] = 0; /* ack num */
+
+	packet[12] = 80; /* header length */
+	packet[13] = 16; /* options */
+	packet[14] = uint8(WINDOW_SIZE >> 8); /* window size */
+	packet[15] = uint8(WINDOW_SIZE & 255); /* window size */
+
+	packet[16] = 0; /* checksum (will be filled later) */
+	packet[17] = 0; /* checksum (will be filled later) */
+
+	packet[18] = 0; /* URG pointer */
+	packet[19] = 0; /* URG pointer */
+
+	/* copy payload */
+	copy(packet[20:20+len(data)], data);
+
+	/* Merge the pseudoheader with the actual packet, to do the checksum calculation. */
+	cksum_calculation_pkt := make([]byte, len(packet)+len(pseudo_header));
+	copy(cksum_calculation_pkt, pseudo_header);
+	copy(cksum_calculation_pkt[len(pseudo_header):], packet);
+	var checksum uint16 = get_tcp_checksum(cksum_calculation_pkt);
+	packet[16] = uint8(checksum >> 8);
+	packet[17] = uint8(checksum & 255);
+
+	return packet;
+}
+
+/* Send 'packet' to the connection 'conn' on TCP port 'port'. The
+connection is not an established TCP connection, so we have to craft
+the TCP headers on our own and send it through a raw socket. After
+sending it, ask the user if he saw a sign of censorship in his packet
+capturing software, and return back his result to the caller.
+
+ XXX_1: No user interaction would be needed if Go had a libpcap wrapper.
+
+ XXX_2: At the moment, the sign of censorship is whether we get an RST
+ back from the host. In the future, we might find more of these quirks
+ and have multiple oracles with different tests and behaviors.
+
+ XXX_3: 'ip' is here because net.IPConn.RemoteAddr() seems to be
+ broken (see issue 3721), and it's needed when calculating the TCP
+ checksum.
+*/
+func query_oracle(payload []byte, port uint16, conn *net.IPConn, ip string) (reply bool) {
+	/* Send the raw TCP packet. */
+	packet := form_tcp_packet(payload, port, conn, ip);
+	_, err := conn.Write(packet);
+	if (err != nil) { panic(err) }
+
+	time.Sleep(1.2 * 1e9);
+	return false;
+}
+
+/* Incrementally mutate 'censored_packet' and send it down to 'channel'. */
+func mutate_packet(channel chan []byte, censored_packet []byte) {
+	packet_len := len(censored_packet);
+
+	for i := 0; i < packet_len ; i++ {
+		mutated_packet := make([]byte, packet_len);
+		copy(mutated_packet, censored_packet);
+		mutated_packet[i] += 1;
+
+		fmt.Printf("Mutate byte '%d' (0x%x -> 0x%x):\n%s",
+			i, censored_packet[i], mutated_packet[i], hex.Dump(mutated_packet));
+
+		channel <- mutated_packet;
+	}
+}
+
 
 func usage() {
 	fmt.Println("d0wser <censored packet> <oracle IP address> <oracle IP port>");
 }
-
-//var i int
-//func mutate_packet_and_send(packet_channel chan []byte, packet []byte) {
-//	
-//	i = i + 1;
-//	
-//
-//}
-//
-
-func query_oracle(next_packet []byte) (reply bool) {
-	//send_raw_tcp_packet
-	
-	// ask the user if he saw the RST or whatever
-	var user_reply string;
-	for {
-		println("Did you see the fnords? [y/n]");
-		fmt.Scan(&user_reply);
-
-		if (user_reply == "y") {
-			return true;
-		} else if (user_reply == "n") {
-			return false;
-		}
-	}
-
-	return false;
-}
-	
 
 func main() {
 	if (len(os.Args) != 4) {
@@ -49,49 +170,33 @@ func main() {
 	}
 
 	packet_fname := os.Args[1];
-//	ip := os.Args[2];
-//	addr := os.Args[3];
+	ip := os.Args[2];
+	port_str := os.Args[3];
 
-	f, err := os.Open(packet_fname);
-	if err != nil { panic(err) }
-	defer f.Close(); // ???
+	port, err := strconv.ParseUint(port_str, 0, 16);
+	if (err != nil) { panic(err) }
 
-	packet_contents := make([]byte, 1600); // XXX static size
-	n, err := f.Read(packet_contents);
-    if err != nil && err != io.EOF { panic(err) }
+	addr, err := net.ResolveIPAddr("ip", ip);
+	if (err != nil) { panic(err) }
+	conn, err := net.DialIP("ip4:tcp", nil, addr); /* XXX no ipv6 */
+	if (err != nil) { panic(err) }
 
-//	packet_channel = make(chan []byte);
+    packet_contents, err := ioutil.ReadFile(packet_fname);
+    if (err != nil) { panic(err) }
 
-	var first_byte_of_fpr_found bool = false;
-	var first_byte_of_fpr int = 0;
-	var last_byte_of_fpr_found bool = false;
-	var last_byte_of_fpr int = 0;
+	/* Make a channel that generates and sends mutated packets. */
+	packet_mutation_channel := make(chan []byte);
+	go mutate_packet(packet_mutation_channel, packet_contents);
 
-	for i := 0; i < n ; i++ {
-		next_packet := make([]byte, n);
-		copy(next_packet, packet_contents);
-		next_packet[i] += 1;
+	/* Send the original censored packet: */
+	/* query_oracle(packet_contents, uint16(port), conn, ip); */
 
-		var oracle_reply bool = false;
-		oracle_reply = query_oracle(next_packet);
+	/* Incrementally mutate the original packet (by increasing each of
+   	 its bytes by one) and send it to the DPI box to see which
+	 mutations bypassed its fingerprints. */
+	for i := 0; i < len(packet_contents) ; i++ {
+		var mutated_packet []byte = <-packet_mutation_channel;
 
-		if (oracle_reply) {
-			if (!first_byte_of_fpr_found) {
-				first_byte_of_fpr_found = true;
-				first_byte_of_fpr = i;
-			} else {
-				last_byte_of_fpr_found = true;
-				last_byte_of_fpr = i;
-			}
-		}
-
-		if first_byte_of_fpr_found == true && last_byte_of_fpr_found == true {
-			break;
-		}
-		
-		println(hex.Dump(next_packet));
+		query_oracle(mutated_packet, uint16(port), conn, ip);
 	}
-
-	println(string(first_byte_of_fpr), string(last_byte_of_fpr))
-
 }
