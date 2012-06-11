@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/binary"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
@@ -19,10 +20,7 @@ func get_tcp_checksum(data []byte) (checksum uint16) {
 	var sum int = 0
 	var size int = len(data)
 
-	for {
-		if size <= 1 {
-			break
-		}
+	for size > 1 {
 		sum += int(data[i])
 		sum += int(data[i+1]) << 8
 		i += 2
@@ -33,9 +31,8 @@ func get_tcp_checksum(data []byte) (checksum uint16) {
 		sum += int(data[i])
 	}
 
-	sum = int((sum >> 16) + (sum & 0xffff))
-
-	sum += int(sum >> 16)
+	sum = (sum >> 16) + (sum & 0xffff)
+	sum += sum >> 16
 
 	// XXX bad code...
 	tmp := uint16(^sum)
@@ -56,9 +53,11 @@ var next_source_port_n func() int = get_next_source_port_n()
 
 /* Return a TCP packet with payload 'data' to TCP port 'dst_port'. */
 func form_tcp_packet(data []byte, dst_port uint16, conn *net.IPConn, ip string) (packet []byte) {
-	const SEQNUM uint32 = 0x1337
-	const HDR_LENGTH uint8 = 20 / 4 // 20 bytes in 32-bit words
-	const WINDOW_SIZE uint16 = 512
+	const (
+		SEQNUM uint32 = 0x1337;
+		HDR_LENGTH uint8 = 20 / 4; // 20 bytes in 32-bit words
+		WINDOW_SIZE uint16 = 512;
+	)
 
 	var SOURCE_PORT uint16 = uint16(next_source_port_n())
 	var tcp_len int = len(data) + 20 // 20 bytes is the minimal TCP header
@@ -73,34 +72,19 @@ func form_tcp_packet(data []byte, dst_port uint16, conn *net.IPConn, ip string) 
 	}
 	pseudo_header[8] = 0 // reserved
 	pseudo_header[9] = 6 // protocol (TCP)
-	pseudo_header[10] = uint8(tcp_len >> 8)
-	pseudo_header[11] = uint8(tcp_len & 255)
+	binary.BigEndian.PutUint16(pseudo_header[10:], uint16(tcp_len))
 
 	/* Create the actual TCP packet. */
 	packet = make([]byte, tcp_len)
-	packet[0] = uint8(SOURCE_PORT >> 8)  /* src port */
-	packet[1] = uint8(SOURCE_PORT & 255) /* src port */
-	packet[2] = uint8(dst_port >> 8)     /* dst port */
-	packet[3] = uint8(dst_port & 255)    /* dst port */
-	packet[4] = uint8(SEQNUM >> 24)      /* seq num */
-	packet[5] = uint8(SEQNUM >> 16)      /* seq num */
-	packet[6] = uint8(SEQNUM >> 8)       /* seq num */
-	packet[7] = uint8(SEQNUM & 255)      /* seq num */
-	packet[8] = 0                        /* ack num */
-	packet[9] = 0                        /* ack num */
-	packet[10] = 0                       /* ack num */
-	packet[11] = 0                       /* ack num */
-
+	binary.BigEndian.PutUint16(packet[0:], SOURCE_PORT)  /* src port */
+	binary.BigEndian.PutUint16(packet[2:], dst_port)  /* dst port */
+	binary.BigEndian.PutUint32(packet[4:], SEQNUM) /* seq num */
+	binary.BigEndian.PutUint32(packet[8:], 0) /* ack num */
 	packet[12] = 80                       /* header length */
 	packet[13] = 16                       /* options */
-	packet[14] = uint8(WINDOW_SIZE >> 8)  /* window size */
-	packet[15] = uint8(WINDOW_SIZE & 255) /* window size */
-
-	packet[16] = 0 /* checksum (will be filled later) */
-	packet[17] = 0 /* checksum (will be filled later) */
-
-	packet[18] = 0 /* URG pointer */
-	packet[19] = 0 /* URG pointer */
+	binary.BigEndian.PutUint16(packet[14:], WINDOW_SIZE) /* window size */
+	binary.BigEndian.PutUint16(packet[16:], 0) /* checksum (will be filled later) */
+	binary.BigEndian.PutUint16(packet[18:], 0) /* URG pointer */
 
 	/* copy payload */
 	copy(packet[20:20+len(data)], data)
@@ -110,8 +94,7 @@ func form_tcp_packet(data []byte, dst_port uint16, conn *net.IPConn, ip string) 
 	copy(cksum_calculation_pkt, pseudo_header)
 	copy(cksum_calculation_pkt[len(pseudo_header):], packet)
 	var checksum uint16 = get_tcp_checksum(cksum_calculation_pkt)
-	packet[16] = uint8(checksum >> 8)
-	packet[17] = uint8(checksum & 255)
+	binary.BigEndian.PutUint16(packet[16:], checksum) /* put the new checksum */
 
 	return packet
 }
@@ -146,10 +129,8 @@ func query_oracle(payload []byte, port uint16, conn *net.IPConn, ip string) (rep
 
 /* Incrementally mutate 'censored_packet' and send it down to 'channel'. */
 func mutate_packet(channel chan []byte, censored_packet []byte) {
-	packet_len := len(censored_packet)
-
-	for i := 0; i < packet_len; i++ {
-		mutated_packet := make([]byte, packet_len)
+	for i := 0; i < range censored_packet; i++ {
+		mutated_packet := make([]byte, len(censored_packet))
 		copy(mutated_packet, censored_packet)
 		mutated_packet[i] += 1
 
