@@ -129,7 +129,7 @@ func query_oracle(payload []byte, port uint16, conn *net.IPConn, ip string) (rep
 
 /* Incrementally mutate 'censored_packet' and send it down to 'channel'. */
 func mutate_packet(channel chan []byte, censored_packet []byte) {
-	for i := 0; i < range censored_packet; i++ {
+	for i := range censored_packet {
 		mutated_packet := make([]byte, len(censored_packet))
 		copy(mutated_packet, censored_packet)
 		mutated_packet[i] += 1
